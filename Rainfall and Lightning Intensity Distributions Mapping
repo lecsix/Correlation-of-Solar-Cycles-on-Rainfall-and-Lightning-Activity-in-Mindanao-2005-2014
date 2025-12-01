@@ -1,0 +1,380 @@
+import os
+from datetime import date, datetime, timedelta
+import numpy as np
+import xarray as xr
+import pandas as pd
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+
+
+# --------------- PATHS AND GRID ----------------
+
+RAIN_DIR = "data/TRMM_3hourly/"
+LIGHTNING_DIR = "data/WWLLN_3hourly/"
+
+lat_extent = (5.275, 9.925)
+lon_extent = (121.275, 127.025)
+lat_dim, lon_dim = 19, 22
+
+lat_increment = (lat_extent[1] - lat_extent[0]) / (lat_dim + 2)
+lon_increment = (lon_extent[1] - lon_extent[0]) / (lon_dim + 2)
+
+lat_values = np.linspace(lat_extent[0], lat_extent[1], lat_dim, endpoint=True)
+lon_values = np.linspace(lon_extent[0], lon_extent[1], lon_dim, endpoint=True)
+
+HOURS = ["00", "03", "06", "09", "12", "15", "18", "21"]
+
+start_date = date(2005, 1, 1)
+end_date   = date(2014, 12, 31)
+
+# Local time is UTC+8
+LOCAL_BIN_LABELS = [
+    "02-05 LT", "05-08 LT", "08-11 LT", "11-14 LT",
+    "14-17 LT", "17-20 LT", "20-23 LT", "23-02 LT"
+]
+
+CARR_PHASE_LABELS = [f"P{i}" for i in range(1, 10)]  # P1..P9
+
+
+# --------------- LOADERS ----------------
+
+def load_3h_rain(y, m, d, hour_str):
+    """
+    Load 3-hour rainfall (mm) on the Mindanao grid.
+    Returns array shape (lat_dim, lon_dim) or None if missing.
+    """
+    fn = f"3B42RT.{y}{m:02d}{d:02d}{hour_str}.7R2.nc4.nc4"
+    path = os.path.join(RAIN_DIR, fn)
+    if not os.path.exists(path):
+        return None
+
+    ds = xr.open_dataset(path)
+    try:
+        if "precipitation" in ds.variables:
+            arr = np.nan_to_num(ds["precipitation"].values)
+        elif "precipitationCal" in ds.variables:
+            arr = np.nan_to_num(ds["precipitationCal"].values)
+        else:
+            return None
+    finally:
+        ds.close()
+
+    # arr in mm/hr, multiply by 3 h to get mm per 3-hour step
+    return arr * 3.0
+
+
+def load_3h_lightning(y, m, d, hour_str):
+    """
+    Load 3-hour WWLLN lightning counts on the Mindanao grid.
+    Returns array shape (lat_dim, lon_dim) or None if missing.
+    """
+    fn = f"A{y}{m:02d}{d:02d}{hour_str}.csv"
+    path = os.path.join(LIGHTNING_DIR, fn)
+    if not os.path.exists(path):
+        return None
+
+    df = pd.read_csv(path)
+    if df.empty or "LATITUDE" not in df.columns or "LONGITUDE" not in df.columns:
+        return None
+
+    grid = np.zeros((lat_dim, lon_dim), dtype=float)
+    for _, row in df.iterrows():
+        lat = row["LATITUDE"]
+        lon = row["LONGITUDE"]
+        i = int(np.floor((lat - lat_extent[0]) / lat_increment))
+        j = int(np.floor((lon - lon_extent[0]) / lon_increment))
+        if 0 <= i < lat_dim and 0 <= j < lon_dim:
+            grid[i, j] += 1.0
+
+    return grid
+
+
+# --------------- MAPPING FUNCTIONS ----------------
+
+def local_bin_index(y, m, d, hour_str):
+    """
+    Map UTC datetime to 3-hour local bin index (0..7) in UTC+8.
+    """
+    h_utc = int(hour_str)
+    dt_utc = datetime(y, m, d, h_utc)
+    dt_local = dt_utc + timedelta(hours=8)
+    bin_idx = (dt_local.hour // 3) % 8
+    return bin_idx
+
+
+def carrington_phase_index(cur_date, ref_start=start_date):
+    """
+    Map calendar date to Carrington 3-day phase index (0..8),
+    within a 27-day rotation starting at ref_start.
+    """
+    delta_days = (cur_date - ref_start).days
+    if delta_days < 0:
+        return None
+    day_in_rotation = delta_days % 27
+    phase_idx = day_in_rotation // 3  # 0..8
+    return int(phase_idx)
+
+
+# --------------- MAIN AGGREGATION ----------------
+
+def compute_all_cycles(start_date, end_date):
+    """
+    Aggregate rainfall and lightning for:
+      1) Monthly (1..12)
+      2) Diurnal 3-hour local bins (0..7)
+      3) Carrington phases P1..P9 (index 0..8)
+      4) Yearly (2005..2014)
+
+    Outputs are sums over 2005-2014.
+    Rainfall in mm, lightning in strokes.
+    """
+
+    # Monthly
+    monthly_rain = {m: np.zeros((lat_dim, lon_dim), float) for m in range(1, 13)}
+    monthly_ltg  = {m: np.zeros((lat_dim, lon_dim), float) for m in range(1, 13)}
+
+    # Diurnal (local)
+    diurnal_rain = {b: np.zeros((lat_dim, lon_dim), float) for b in range(8)}
+    diurnal_ltg  = {b: np.zeros((lat_dim, lon_dim), float) for b in range(8)}
+
+    # Carrington phases (P1..P9)
+    carr_rain = {p: np.zeros((lat_dim, lon_dim), float) for p in range(9)}
+    carr_ltg  = {p: np.zeros((lat_dim, lon_dim), float) for p in range(9)}
+
+    # Yearly
+    years = range(start_date.year, end_date.year + 1)
+    yearly_rain = {y: np.zeros((lat_dim, lon_dim), float) for y in years}
+    yearly_ltg  = {y: np.zeros((lat_dim, lon_dim), float) for y in years}
+
+    cur = start_date
+    while cur <= end_date:
+        y = cur.year
+        m = cur.month
+        d = cur.day
+
+        carr_idx = carrington_phase_index(cur)
+        if carr_idx is None:
+            cur += timedelta(days=1)
+            continue
+
+        for hour_str in HOURS:
+            rain_3h = load_3h_rain(y, m, d, hour_str)
+            ltg_3h  = load_3h_lightning(y, m, d, hour_str)
+
+            if rain_3h is None and ltg_3h is None:
+                continue
+
+            if rain_3h is None:
+                rain_3h = np.zeros((lat_dim, lon_dim), float)
+            if ltg_3h is None:
+                ltg_3h = np.zeros((lat_dim, lon_dim), float)
+
+            # Monthly totals
+            monthly_rain[m] += rain_3h
+            monthly_ltg[m]  += ltg_3h
+
+            # Yearly totals
+            yearly_rain[y] += rain_3h
+            yearly_ltg[y]  += ltg_3h
+
+            # Diurnal local 3-hour bin
+            b = local_bin_index(y, m, d, hour_str)
+            diurnal_rain[b] += rain_3h
+            diurnal_ltg[b]  += ltg_3h
+
+            # Carrington phase totals
+            carr_rain[carr_idx] += rain_3h
+            carr_ltg[carr_idx]  += ltg_3h
+
+        cur += timedelta(days=1)
+
+    out = {
+        "monthly_rain": monthly_rain,
+        "monthly_ltg": monthly_ltg,
+        "diurnal_rain": diurnal_rain,
+        "diurnal_ltg": diurnal_ltg,
+        "carr_rain": carr_rain,
+        "carr_ltg": carr_ltg,
+        "yearly_rain": yearly_rain,
+        "yearly_ltg": yearly_ltg,
+    }
+    return out
+
+
+# --------------- PLOTTING HELPERS ----------------
+
+def plot_map(field, title, cmap, vmin, vmax, cbar_label):
+    """
+    Plot one 2D field over the Mindanao grid.
+    """
+    fig, ax = plt.subplots(subplot_kw={"projection": ccrs.PlateCarree()})
+
+    ax.set_extent(
+        [lon_values[0], lon_values[-1], lat_values[0], lat_values[-1]],
+        crs=ccrs.PlateCarree()
+    )
+
+    data_plot = np.flipud(field)
+
+    im = ax.imshow(
+        data_plot,
+        origin="upper",
+        extent=[lon_values[0], lon_values[-1], lat_values[0], lat_values[-1]],
+        transform=ccrs.PlateCarree(),
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax
+    )
+
+    ax.add_feature(cfeature.COASTLINE, linewidth=1.0)
+    ax.add_feature(cfeature.BORDERS, linewidth=0.8)
+    ax.gridlines(draw_labels=True)
+
+    cbar = plt.colorbar(im, ax=ax, orientation="vertical", fraction=0.02, pad=0.08)
+    cbar.set_label(cbar_label)
+
+    ax.set_title(title)
+    plt.tight_layout()
+    plt.show()
+
+
+# --------------- PLOT EACH CYCLE ----------------
+
+def plot_monthly_cycle(monthly_rain, monthly_ltg):
+    max_rain = max(np.nanmax(v) for v in monthly_rain.values())
+    max_ltg  = max(np.nanmax(v) for v in monthly_ltg.values())
+
+    for m in range(1, 13):
+        month_name = date(2000, m, 1).strftime("%B")
+
+        title_r = f"TRMM rainfall total, {month_name} (2005-2014)"
+        plot_map(
+            monthly_rain[m],
+            title_r,
+            cmap="Blues",
+            vmin=0.0,
+            vmax=max_rain,
+            cbar_label="Total rainfall (mm)"
+        )
+
+        title_l = f"WWLLN lightning total, {month_name} (2005-2014)"
+        plot_map(
+            monthly_ltg[m],
+            title_l,
+            cmap="Reds",
+            vmin=0.0,
+            vmax=max_ltg,
+            cbar_label="Total lightning strokes"
+        )
+
+
+def plot_diurnal_cycle(diurnal_rain, diurnal_ltg):
+    max_rain = max(np.nanmax(v) for v in diurnal_rain.values())
+    max_ltg  = max(np.nanmax(v) for v in diurnal_ltg.values())
+
+    for b in range(8):
+        label = LOCAL_BIN_LABELS[b]
+
+        title_r = f"TRMM rainfall total, {label} (2005-2014)"
+        plot_map(
+            diurnal_rain[b],
+            title_r,
+            cmap="Blues",
+            vmin=0.0,
+            vmax=max_rain,
+            cbar_label="Total rainfall (mm)"
+        )
+
+        title_l = f"WWLLN lightning total, {label} (2005-2014)"
+        plot_map(
+            diurnal_ltg[b],
+            title_l,
+            cmap="Reds",
+            vmin=0.0,
+            vmax=max_ltg,
+            cbar_label="Total lightning strokes"
+        )
+
+
+def plot_carrington_cycle(carr_rain, carr_ltg):
+    max_rain = max(np.nanmax(v) for v in carr_rain.values())
+    max_ltg  = max(np.nanmax(v) for v in carr_ltg.values())
+
+    for p in range(9):
+        label = CARR_PHASE_LABELS[p]
+
+        title_r = f"TRMM rainfall total, Carrington phase {label} (2005-2014)"
+        plot_map(
+            carr_rain[p],
+            title_r,
+            cmap="Blues",
+            vmin=0.0,
+            vmax=max_rain,
+            cbar_label="Total rainfall (mm)"
+        )
+
+        title_l = f"WWLLN lightning total, Carrington phase {label} (2005-2014)"
+        plot_map(
+            carr_ltg[p],
+            title_l,
+            cmap="Reds",
+            vmin=0.0,
+            vmax=max_ltg,
+            cbar_label="Total lightning strokes"
+        )
+
+
+def plot_yearly_cycle(yearly_rain, yearly_ltg):
+    max_rain = max(np.nanmax(v) for v in yearly_rain.values())
+    max_ltg  = max(np.nanmax(v) for v in yearly_ltg.values())
+
+    for y in sorted(yearly_rain.keys()):
+        title_r = f"TRMM rainfall total, {y}"
+        plot_map(
+            yearly_rain[y],
+            title_r,
+            cmap="Blues",
+            vmin=0.0,
+            vmax=max_rain,
+            cbar_label="Total rainfall (mm)"
+        )
+
+        title_l = f"WWLLN lightning total, {y}"
+        plot_map(
+            yearly_ltg[y],
+            title_l,
+            cmap="Reds",
+            vmin=0.0,
+            vmax=max_ltg,
+            cbar_label="Total lightning strokes"
+        )
+
+
+# --------------- MAIN ----------------
+
+if __name__ == "__main__":
+    result = compute_all_cycles(start_date, end_date)
+
+    monthly_rain = result["monthly_rain"]
+    monthly_ltg  = result["monthly_ltg"]
+    diurnal_rain = result["diurnal_rain"]
+    diurnal_ltg  = result["diurnal_ltg"]
+    carr_rain    = result["carr_rain"]
+    carr_ltg     = result["carr_ltg"]
+    yearly_rain  = result["yearly_rain"]
+    yearly_ltg   = result["yearly_ltg"]
+
+    # 1. Monthly maps
+    plot_monthly_cycle(monthly_rain, monthly_ltg)
+
+    # 2. 3-hourly diurnal maps (local time)
+    plot_diurnal_cycle(diurnal_rain, diurnal_ltg)
+
+    # 3. Carrington-phase maps (P1..P9)
+    plot_carrington_cycle(carr_rain, carr_ltg)
+
+    # 4. Yearly maps (2005-2014)
+    plot_yearly_cycle(yearly_rain, yearly_ltg)
+
+
