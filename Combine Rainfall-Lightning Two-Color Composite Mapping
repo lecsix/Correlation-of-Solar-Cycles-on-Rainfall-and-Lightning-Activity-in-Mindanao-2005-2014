@@ -1,0 +1,381 @@
+import os
+import datetime
+import numpy as np
+import xarray as xr
+import pandas as pd
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+
+# =============================
+# Config
+# =============================
+
+RAIN_DIR = "data/TRMM_3hourly/"
+LIGHTNING_DIR = "data/WWLLN_3hourly/"
+
+# Geographic ROI and grid (19 x 22)
+LAT_MIN, LAT_MAX = 5.275, 9.925
+LON_MIN, LON_MAX = 121.275, 127.025
+LAT_DIM, LON_DIM = 19, 22
+
+lat_edges = np.linspace(LAT_MIN, LAT_MAX, LAT_DIM + 1)
+lon_edges = np.linspace(LON_MIN, LON_MAX, LON_DIM + 1)
+
+extent = [lon_edges[0], lon_edges[-1], lat_edges[0], lat_edges[-1]]
+
+# 3-hour UTC bins
+UTC_HOURS = ["00", "03", "06", "09", "12", "15", "18", "21"]
+
+# Diurnal panels in UTC order, titles show UTC and local time (UTC+8)
+# 00 UTC = 08 LT, 03 UTC = 11 LT, ..., 21 UTC = 05 LT (next day)
+UTC_PANEL_ORDER = [
+    ("00", "00 UTC (08 LT)"),
+    ("03", "03 UTC (11 LT)"),
+    ("06", "06 UTC (14 LT)"),
+    ("09", "09 UTC (17 LT)"),
+    ("12", "12 UTC (20 LT)"),
+    ("15", "15 UTC (23 LT)"),
+    ("18", "18 UTC (02 LT)"),
+    ("21", "21 UTC (05 LT)")
+]
+
+# Date range
+START_DATE = datetime.date(2005, 1, 1)
+END_DATE   = datetime.date(2014, 12, 31)
+
+YEARS = list(range(2005, 2015))  # 2005–2014 inclusive
+
+# Carrington setup
+CARRINGTON_REF_DATE = datetime.date(2005, 1, 1)
+CARRINGTON_PERIOD_DAYS = 27
+CARRINGTON_PHASE_LEN = 3
+CARRINGTON_PHASE_COUNT = CARRINGTON_PERIOD_DAYS // CARRINGTON_PHASE_LEN  # 9
+CARRINGTON_PHASE_LABELS = [f"P{i}" for i in range(1, CARRINGTON_PHASE_COUNT + 1)]
+
+
+# =============================
+# Helpers
+# =============================
+
+def carrington_phase_index(d):
+    delta_days = (d - CARRINGTON_REF_DATE).days
+    mod = delta_days % CARRINGTON_PERIOD_DAYS
+    idx = int(mod // CARRINGTON_PHASE_LEN)
+    return idx
+
+
+def find_coord_names(ds):
+    lat_candidates = ["lat", "latitude", "Latitude", "LAT"]
+    lon_candidates = ["lon", "longitude", "Longitude", "LON"]
+
+    lat_name = next((n for n in lat_candidates if n in ds.variables or n in ds.coords), None)
+    lon_name = next((n for n in lon_candidates if n in ds.variables or n in ds.coords), None)
+
+    if lat_name is None or lon_name is None:
+        raise KeyError("Latitude/longitude coordinates not found in rain file.")
+
+    return lat_name, lon_name
+
+
+def find_precip_var(ds):
+    candidates = ["precipitation", "precipitationCal", "precip", "rain", "tp"]
+    v = next((n for n in candidates if n in ds.variables), None)
+    if v is None:
+        raise KeyError("Precipitation variable not found in rain file.")
+    return v
+
+
+def subset_and_sort(ds, lat_name, lon_name):
+    lat = ds[lat_name]
+    lon = ds[lon_name]
+
+    if lat[0] > lat[-1]:
+        ds = ds.reindex({lat_name: lat[::-1]})
+        lat = ds[lat_name]
+
+    if lon[0] > lon[-1]:
+        ds = ds.reindex({lon_name: lon[::-1]})
+        lon = ds[lon_name]
+
+    ds = ds.sel({lat_name: slice(LAT_MIN, LAT_MAX),
+                 lon_name: slice(LON_MIN, LON_MAX)})
+    return ds
+
+
+def regrid_to_target(lat1d, lon1d, values2d):
+    Lon2d, Lat2d = np.meshgrid(lon1d.values, lat1d.values)
+
+    w_sum, _, _ = np.histogram2d(
+        Lat2d.ravel(),
+        Lon2d.ravel(),
+        bins=[lat_edges, lon_edges],
+        weights=values2d.ravel()
+    )
+
+    counts, _, _ = np.histogram2d(
+        Lat2d.ravel(),
+        Lon2d.ravel(),
+        bins=[lat_edges, lon_edges]
+    )
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        avg = w_sum / np.maximum(counts, 1.0)
+
+    return np.nan_to_num(avg, nan=0.0)
+
+
+def bin_lightning_csv(df):
+    lat_col = next((c for c in df.columns if c.lower() in ["lat", "latitude"]), None)
+    lon_col = next((c for c in df.columns if c.lower() in ["lon", "longitude"]), None)
+
+    if lat_col is None or lon_col is None:
+        raise KeyError("Lightning CSV missing LAT/LON columns.")
+
+    dff = df[
+        (df[lat_col] >= LAT_MIN) & (df[lat_col] <= LAT_MAX) &
+        (df[lon_col] >= LON_MIN) & (df[lon_col] <= LON_MAX)
+    ]
+
+    if dff.empty:
+        return np.zeros((LAT_DIM, LON_DIM), dtype=float)
+
+    counts, _, _ = np.histogram2d(
+        dff[lat_col].values,
+        dff[lon_col].values,
+        bins=[lat_edges, lon_edges]
+    )
+
+    return counts.astype(float)
+
+
+def percentile_scale(arr, mask_zero=True):
+    a = np.asarray(arr, float)
+    out = np.zeros_like(a, float)
+
+    if mask_zero:
+        m = a > 0
+        vals = a[m]
+    else:
+        m = np.ones_like(a, bool)
+        vals = a.ravel()
+
+    if vals.size == 0:
+        return out
+
+    order = np.argsort(vals)
+    ranks = np.empty_like(order, float)
+    ranks[order] = np.linspace(0.0, 1.0, num=vals.size, endpoint=True)
+    out[m] = ranks
+    return out
+
+
+def make_rgb(light_mat, rain_mat):
+    if light_mat.shape != rain_mat.shape:
+        raise ValueError("Lightning and rainfall arrays must have the same shape.")
+
+    r = np.clip(percentile_scale(light_mat), 0.0, 1.0)
+    b = np.clip(percentile_scale(rain_mat), 0.0, 1.0)
+
+    w = (1.0 - r) * (1.0 - b)
+    s = r * b
+
+    R = (1.0 - s) * (1.0 - b) + 0.5 * s
+    G = (1.0 - s) * w
+    B = (1.0 - s) * (1.0 - r) + 0.5 * s
+
+    rgb = np.dstack([R, G, B])
+    return np.clip(rgb, 0.0, 1.0)
+
+
+def plot_panel(rgb_dict, keys, titles, nrows, ncols, suptitle=None):
+    proj = ccrs.PlateCarree()
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(4 * ncols, 3 * nrows),
+        subplot_kw={"projection": proj}
+    )
+
+    if isinstance(axes, np.ndarray):
+        axes_flat = axes.ravel()
+    else:
+        axes_flat = [axes]
+
+    for ax, key, title in zip(axes_flat, keys, titles):
+        ax.set_extent(extent, crs=proj)
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.4)
+        ax.add_feature(cfeature.BORDERS, linewidth=0.3)
+
+        img = rgb_dict[key]
+        ax.imshow(
+            img,
+            origin="lower",
+            extent=extent,
+            transform=proj,
+            interpolation="nearest"
+        )
+
+        ax.set_title(title, fontweight="bold", fontsize=12)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    for ax in axes_flat[len(keys):]:
+        ax.set_visible(False)
+
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=14)
+
+    plt.tight_layout()
+    plt.show()
+
+
+# =============================
+# Accumulate 2005–2014 totals
+# =============================
+
+# Monthly
+monthly_rain = {m: np.zeros((LAT_DIM, LON_DIM), float) for m in range(1, 13)}
+monthly_ltg  = {m: np.zeros((LAT_DIM, LON_DIM), float) for m in range(1, 13)}
+
+# Diurnal (UTC bins)
+diurnal_rain = {hh: np.zeros((LAT_DIM, LON_DIM), float) for hh in UTC_HOURS}
+diurnal_ltg  = {hh: np.zeros((LAT_DIM, LON_DIM), float) for hh in UTC_HOURS}
+
+# Carrington phases 0..8
+carr_rain = {p: np.zeros((LAT_DIM, LON_DIM), float) for p in range(CARRINGTON_PHASE_COUNT)}
+carr_ltg  = {p: np.zeros((LAT_DIM, LON_DIM), float) for p in range(CARRINGTON_PHASE_COUNT)}
+
+# Yearly
+yearly_rain = {y: np.zeros((LAT_DIM, LON_DIM), float) for y in YEARS}
+yearly_ltg  = {y: np.zeros((LAT_DIM, LON_DIM), float) for y in YEARS}
+
+cur = START_DATE
+n_days = 0
+
+while cur <= END_DATE:
+    y, m, d = cur.year, cur.month, cur.day
+    ymd = f"{y}{m:02d}{d:02d}"
+
+    carr_idx = carrington_phase_index(cur)
+
+    for hh in UTC_HOURS:
+        # Rainfall
+        rain_file = os.path.join(RAIN_DIR, f"3B42RT.{ymd}{hh}.7R2.nc4.nc4")
+        if os.path.exists(rain_file):
+            ds = None
+            try:
+                ds = xr.open_dataset(rain_file)
+                lat_name, lon_name = find_coord_names(ds)
+                var_name = find_precip_var(ds)
+                ds = subset_and_sort(ds, lat_name, lon_name)
+
+                vals = ds[var_name]
+                if "time" in vals.dims:
+                    vals = vals.isel(time=0)
+
+                rain_mm = np.nan_to_num(vals.values, nan=0.0) * 3.0  # mm per 3h
+                rain_grid = regrid_to_target(ds[lat_name], ds[lon_name], rain_mm)
+
+                monthly_rain[m] += rain_grid
+                diurnal_rain[hh] += rain_grid
+                carr_rain[carr_idx] += rain_grid
+                yearly_rain[y] += rain_grid
+
+            except Exception as e:
+                print(f"Rain read failed for {rain_file}: {e}")
+            finally:
+                if ds is not None:
+                    ds.close()
+
+        # Lightning
+        ltg_file = os.path.join(LTG_DIR, f"A{ymd}{hh}.csv")
+        if os.path.exists(ltg_file):
+            try:
+                df = pd.read_csv(ltg_file)
+                ltg_grid = bin_lightning_csv(df)
+
+                monthly_ltg[m] += ltg_grid
+                diurnal_ltg[hh] += ltg_grid
+                carr_ltg[carr_idx] += ltg_grid
+                yearly_ltg[y] += ltg_grid
+
+            except Exception as e:
+                print(f"Lightning read failed for {ltg_file}: {e}")
+
+    n_days += 1
+    if (n_days % 100) == 0:
+        print(f"Processed {n_days} days up to {cur}")
+
+    cur += datetime.timedelta(days=1)
+
+print("Finished accumulation.")
+
+
+# =============================
+# Build RGB fields for each cycle
+# =============================
+
+# Monthly
+monthly_rgb = {m: make_rgb(monthly_ltg[m], monthly_rain[m]) for m in range(1, 13)}
+
+# Diurnal (UTC order, titles show both UTC and LT)
+diurnal_rgb_utc = {}
+diurnal_titles = []
+
+for utc_h, title in UTC_PANEL_ORDER:
+    diurnal_rgb_utc[utc_h] = make_rgb(diurnal_ltg[utc_h], diurnal_rain[utc_h])
+    diurnal_titles.append(title)
+
+# Carrington
+carr_rgb = {p: make_rgb(carr_ltg[p], carr_rain[p]) for p in range(CARRINGTON_PHASE_COUNT)}
+
+# Yearly
+yearly_rgb = {y: make_rgb(yearly_ltg[y], yearly_rain[y]) for y in YEARS}
+
+
+# =============================
+# Plot panels
+# =============================
+
+# Monthly 3×4
+month_names = ["Jan","Feb","Mar","Apr","May","Jun",
+               "Jul","Aug","Sep","Oct","Nov","Dec"]
+plot_panel(
+    monthly_rgb,
+    keys=list(range(1, 13)),
+    titles=month_names,
+    nrows=3,
+    ncols=4,
+    suptitle="Monthly rainfall–lightning composites (2005–2014)"
+)
+
+# Diurnal 2×4, in UTC order, titles show UTC and local time
+plot_panel(
+    diurnal_rgb_utc,
+    keys=[utc for utc, _ in UTC_PANEL_ORDER],
+    titles=diurnal_titles,
+    nrows=2,
+    ncols=4,
+    suptitle="Diurnal 3-hourly rainfall–lightning composites (UTC bins, local time in brackets, 2005–2014)"
+)
+
+# Carrington 3×3
+plot_panel(
+    carr_rgb,
+    keys=list(range(CARRINGTON_PHASE_COUNT)),
+    titles=CARRINGTON_PHASE_LABELS,
+    nrows=3,
+    ncols=3,
+    suptitle="Carrington-phase rainfall–lightning composites (2005–2014)"
+)
+
+# Yearly 2×5
+year_titles = [str(y) for y in YEARS]
+plot_panel(
+    yearly_rgb,
+    keys=YEARS,
+    titles=year_titles,
+    nrows=2,
+    ncols=5,
+    suptitle="Yearly rainfall–lightning composites (2005–2014)"
+)
