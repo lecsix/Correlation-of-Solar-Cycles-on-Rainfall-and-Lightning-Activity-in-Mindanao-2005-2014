@@ -1,0 +1,330 @@
+import os
+import numpy as np
+import xarray as xr
+import pandas as pd
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from matplotlib.colors import ListedColormap, BoundaryNorm
+from datetime import date, datetime, timedelta
+
+# ================== PATHS AND GRID ==================
+
+RAIN_DIR      = "/Users/alexisvalderama/Desktop/Thesis/Data/RR NEW/"
+LIGHTNING_DIR = "/Users/alexisvalderama/Desktop/Thesis/Data/LD NEW/"
+
+lat_extent = (5.275, 9.925)
+lon_extent = (121.275, 127.025)
+lat_dim, lon_dim = 19, 22
+
+lat_min, lat_max = lat_extent
+lon_min, lon_max = lon_extent
+
+lat_increment = (lat_max - lat_min) / (lat_dim + 2)
+lon_increment = (lon_max - lon_min) / (lon_dim + 2)
+
+lat_values = np.linspace(lat_min, lat_max, lat_dim, endpoint=True)
+lon_values = np.linspace(lon_min, lon_max, lon_dim, endpoint=True)
+
+START_DATE = date(2005, 1, 1)
+END_DATE   = date(2014, 12, 31)
+
+HOURS_UTC = ["00", "03", "06", "09", "12", "15", "18", "21"]
+
+YEAR_START = 2005
+YEAR_END   = 2014
+YEARS      = np.arange(YEAR_START, YEAR_END + 1)
+N_YEARS    = len(YEARS)
+
+# ================== LABEL MAPPINGS ==================
+
+# Monthly
+MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+# Diurnal 3-hourly, local time (UTC+8) bin centers
+# We use the eight centers: 02, 05, 08, 11, 14, 17, 20, 23 LT
+DIURNAL_CENTERS_LT = [2, 5, 8, 11, 14, 17, 20, 23]
+DIURNAL_LABELS = ["03", "06", "09", "12",
+                  "15", "18", "21", "00"]
+
+# Carrington phases: 9 phases of 3 days each in a 27-day rotation
+# Phase index k = 0..8, labels P1..P9
+CARR_LABELS = [f"P{i}" for i in range(1, 10)]
+
+# Yearly
+YEAR_LABELS = [str(y) for y in YEARS]
+
+
+# ================== LOADERS ==================
+
+def load_3h_rain(y, m, d, hour_str):
+    """
+    Load 3-hour rainfall (mm) on the Mindanao grid.
+    Returns array (lat_dim, lon_dim) or None if missing.
+    """
+    fn = f"3B42RT.{y}{m:02d}{d:02d}{hour_str}.7R2.nc4.nc4"
+    path = os.path.join(RAIN_DIR, fn)
+    if not os.path.exists(path):
+        return None
+
+    ds = xr.open_dataset(path)
+    try:
+        if "precipitation" in ds.variables:
+            arr = np.nan_to_num(ds["precipitation"].values)
+        elif "precipitationCal" in ds.variables:
+            arr = np.nan_to_num(ds["precipitationCal"].values)
+        else:
+            return None
+    finally:
+        ds.close()
+
+    # arr is mm/hr, convert to mm per 3 hours
+    return arr * 3.0
+
+
+def load_3h_lightning(y, m, d, hour_str):
+    """
+    Load 3-hour WWLLN lightning counts on the Mindanao grid.
+    Returns array (lat_dim, lon_dim) or None if missing.
+    """
+    fn = f"A{y}{m:02d}{d:02d}{hour_str}.csv"
+    path = os.path.join(LIGHTNING_DIR, fn)
+    if not os.path.exists(path):
+        return None
+
+    df = pd.read_csv(path)
+    if df.empty or "LATITUDE" not in df.columns or "LONGITUDE" not in df.columns:
+        return None
+
+    grid = np.zeros((lat_dim, lon_dim), dtype=float)
+    for _, row in df.iterrows():
+        lat = row["LATITUDE"]
+        lon = row["LONGITUDE"]
+        i = int((lat - lat_min) // lat_increment)
+        j = int((lon - lon_min) // lon_increment)
+        if 0 <= i < lat_dim and 0 <= j < lon_dim:
+            grid[i, j] += 1.0
+
+    return grid
+
+
+def diurnal_bin_from_utc(y, m, d, hour_str):
+    """
+    Map a UTC 3-hour step to an 8-bin local-time index using UTC+8.
+    Each UTC step is treated as a single instant at hh:00 UTC.
+    """
+    h_utc = int(hour_str)
+    dt_utc = datetime(y, m, d, h_utc)
+    dt_local = dt_utc + timedelta(hours=8)
+    h_local = dt_local.hour  # in {2, 5, 8, 11, 14, 17, 20, 23}
+
+    if h_local not in DIURNAL_CENTERS_LT:
+        # Safety: if data is outside the expected set, fold to nearest center
+        diffs = [abs(h_local - c) for c in DIURNAL_CENTERS_LT]
+        return int(np.argmin(diffs))
+
+    return DIURNAL_CENTERS_LT.index(h_local)
+
+
+def carrington_phase_index(cur_date):
+    """
+    Carrington-style phase index, 9 phases per 27-day cycle.
+    Phase index is 0..8 (P1..P9).
+    """
+    delta_days = (cur_date - START_DATE).days
+    pos_in_cycle = delta_days % 27
+    phase = pos_in_cycle // 3   # 0..8
+    return int(phase)
+
+
+def year_index(y):
+    """
+    Map year to index 0..N_YEARS-1.
+    """
+    return int(y - YEAR_START)
+
+
+# ================== COMPLEX AVERAGE ==================
+
+def complex_average_cycle(data_3d, n_bins):
+    """
+    Compute circular mean phase index per grid cell.
+
+    data_3d: (lat, lon, n_bins) with non-negative weights.
+    Returns: (lat, lon) float array with phase in [0, n_bins),
+             masked where all weights are zero or NaN.
+    """
+    ny, nx, nb = data_3d.shape
+    assert nb == n_bins
+
+    avg_idx = np.full((ny, nx), np.nan, float)
+
+    angles = 2.0 * np.pi * np.arange(n_bins) / n_bins
+
+    for i in range(ny):
+        for j in range(nx):
+            w = data_3d[i, j, :]
+            if not np.any(np.isfinite(w)) or np.all(w == 0.0):
+                continue
+
+            z = np.sum(w * np.exp(1j * angles))
+            if np.isclose(abs(z), 0.0):
+                continue
+
+            theta = np.angle(z)
+            if theta < 0:
+                theta += 2.0 * np.pi
+
+            idx = (theta / (2.0 * np.pi)) * n_bins
+            avg_idx[i, j] = idx
+
+    return np.ma.masked_invalid(avg_idx)
+
+
+# ================== PLOTTING ==================
+
+def plot_clock_map(avg_idx, labels, title):
+    """
+    Generic clock map plot.
+    avg_idx: (lat, lon) values in [0, N),
+    labels: list of N strings for colorbar ticks.
+    """
+    n_bins = len(labels)
+
+    fig, ax = plt.subplots(subplot_kw={"projection": ccrs.PlateCarree()})
+
+    ax.set_extent([lon_min, lon_max, lat_min, lat_max])
+    ax.add_feature(cfeature.COASTLINE, linewidth=1.0)
+    ax.add_feature(cfeature.BORDERS, linewidth=0.8)
+    ax.gridlines(draw_labels=True)
+
+    lon_bins = np.linspace(lon_min, lon_max, lon_dim + 1)
+    lat_bins = np.linspace(lat_min, lat_max, lat_dim + 1)
+
+    base_cmap = plt.cm.gist_rainbow
+    colors_n = base_cmap(np.linspace(0, 1, n_bins))
+    cmap = ListedColormap(colors_n)
+    boundaries = np.arange(-0.5, n_bins + 0.5, 1.0)
+    norm = BoundaryNorm(boundaries, cmap.N)
+
+    field = avg_idx
+
+    img = ax.pcolormesh(
+        lon_bins,
+        lat_bins,
+        field,
+        cmap=cmap,
+        norm=norm,
+        transform=ccrs.PlateCarree(),
+        shading="auto"
+    )
+
+    cbar = plt.colorbar(img, ax=ax, ticks=np.arange(0, n_bins, 1))
+    cbar.ax.set_yticklabels(labels)
+    cbar.set_label("Cycle phase")
+
+    ax.set_title(title)
+    plt.tight_layout()
+    plt.show()
+
+
+# ================== MAIN AGGREGATION ==================
+
+if __name__ == "__main__":
+
+    # Storage: (lat, lon, Nbins)
+    rain_month   = np.zeros((lat_dim, lon_dim, 12), float)
+    ltg_month    = np.zeros((lat_dim, lon_dim, 12), float)
+
+    rain_diurnal = np.zeros((lat_dim, lon_dim, len(DIURNAL_CENTERS_LT)), float)
+    ltg_diurnal  = np.zeros((lat_dim, lon_dim, len(DIURNAL_CENTERS_LT)), float)
+
+    rain_carr    = np.zeros((lat_dim, lon_dim, len(CARR_LABELS)), float)
+    ltg_carr     = np.zeros((lat_dim, lon_dim, len(CARR_LABELS)), float)
+
+    rain_year    = np.zeros((lat_dim, lon_dim, N_YEARS), float)
+    ltg_year     = np.zeros((lat_dim, lon_dim, N_YEARS), float)
+
+    cur = START_DATE
+    while cur <= END_DATE:
+        y, m, d = cur.year, cur.month, cur.day
+        m_idx = m - 1
+        y_idx = year_index(y)
+        carr_idx = carrington_phase_index(cur)
+
+        for h in HOURS_UTC:
+            r3 = load_3h_rain(y, m, d, h)
+            l3 = load_3h_lightning(y, m, d, h)
+
+            if r3 is None and l3 is None:
+                continue
+
+            # Monthly
+            if r3 is not None:
+                rain_month[:, :, m_idx] += r3
+                rain_year[:, :, y_idx]  += r3
+                rain_carr[:, :, carr_idx] += r3
+            if l3 is not None:
+                ltg_month[:, :, m_idx] += l3
+                ltg_year[:, :, y_idx]  += l3
+                ltg_carr[:, :, carr_idx] += l3
+
+            # Diurnal bin (local time)
+            bin_d = diurnal_bin_from_utc(y, m, d, h)
+            if r3 is not None:
+                rain_diurnal[:, :, bin_d] += r3
+            if l3 is not None:
+                ltg_diurnal[:, :, bin_d] += l3
+
+        cur += timedelta(days=1)
+
+    # Complex means
+    avg_month_rain   = complex_average_cycle(rain_month,   n_bins=12)
+    avg_month_ltg    = complex_average_cycle(ltg_month,    n_bins=12)
+
+    avg_diurnal_rain = complex_average_cycle(rain_diurnal, n_bins=len(DIURNAL_CENTERS_LT))
+    avg_diurnal_ltg  = complex_average_cycle(ltg_diurnal,  n_bins=len(DIURNAL_CENTERS_LT))
+
+    avg_carr_rain    = complex_average_cycle(rain_carr,    n_bins=len(CARR_LABELS))
+    avg_carr_ltg     = complex_average_cycle(ltg_carr,     n_bins=len(CARR_LABELS))
+
+    avg_year_rain    = complex_average_cycle(rain_year,    n_bins=N_YEARS)
+    avg_year_ltg     = complex_average_cycle(ltg_year,     n_bins=N_YEARS)
+
+    # Plots
+    # 1) Monthly cycle
+    plot_clock_map(avg_month_rain,
+                   MONTH_LABELS,
+                   "Average month of rainfall peak (complex mean, 2005–2014)")
+
+    plot_clock_map(avg_month_ltg,
+                   MONTH_LABELS,
+                   "Average month of lightning peak (complex mean, 2005–2014)")
+
+    # 2) Diurnal 3-hourly cycle
+    plot_clock_map(avg_diurnal_rain,
+                   DIURNAL_LABELS,
+                   "Average 3-hour local time of rainfall peak (complex mean)")
+
+    plot_clock_map(avg_diurnal_ltg,
+                   DIURNAL_LABELS,
+                   "Average 3-hour local time of lightning peak (complex mean)")
+
+    # 3) Carrington 27-day phases (P1..P9)
+    plot_clock_map(avg_carr_rain,
+                   CARR_LABELS,
+                   "Average Carrington phase of rainfall peak (P1–P9)")
+
+    plot_clock_map(avg_carr_ltg,
+                   CARR_LABELS,
+                   "Average Carrington phase of lightning peak (P1–P9)")
+
+    # 4) Yearly cycle (2005–2014)
+    plot_clock_map(avg_year_rain,
+                   YEAR_LABELS,
+                   "Average Schwabe-cycle year of rainfall peak (2005–2014)")
+
+    plot_clock_map(avg_year_ltg,
+                   YEAR_LABELS,
+                   "Average Schwabe-cycle year of lightning peak (2005–2014)")
