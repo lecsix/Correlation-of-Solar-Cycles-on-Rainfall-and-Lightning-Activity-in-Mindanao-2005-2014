@@ -1,0 +1,1178 @@
+import os
+import re
+import glob
+import numpy as np
+import pandas as pd
+import xarray as xr
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import AgglomerativeClustering, KMeans
+
+# Optional Cartopy for maps
+_USE_CARTOPY = True
+try:
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+except Exception:
+    _USE_CARTOPY = False
+
+# Optional MiniSom for SOM
+try:
+    from minisom import MiniSom
+    _HAVE_MINISOM = True
+except Exception:
+    _HAVE_MINISOM = False
+
+# Optional SciPy for KS tests
+try:
+    from scipy.stats import ks_2samp
+    _HAVE_SCIPY = True
+except Exception:
+    _HAVE_SCIPY = False
+
+# ----------------- CONFIG -----------------
+RAIN_DIR = "data/TRMM_3hourly/"
+LIGHTNING_DIR = "data/WWLLN_3hourly/"
+OUT_ROOT      = "output/som_allcycles"
+
+YEAR_START = 2005
+YEAR_END   = 2014
+N_YEARS_TOTAL = YEAR_END - YEAR_START + 1
+
+# convert UTC to UTC+8 (solar local time) where needed
+TZ_SHIFT_HOURS = 8
+
+K_FOR_FINAL = 4
+SMOOTH_LABEL_PASSES = 1
+RANDOM_SEED = 42
+
+USE_SOM = True and _HAVE_MINISOM
+SOM_ROWS, SOM_COLS = 10, 11
+SOM_SIGMA = 4.0
+SOM_LR    = 0.4
+SOM_TOTAL_ITERS = 60000
+SOM_CHECKPOINTS = [0, 2000, 5000, 10000, 20000, 30000, 45000, 60000]
+
+CLASS_COLORS = ["#4daf4a", "#377eb8", "#e41a1c", "#ffd300"]
+cls_cmap = ListedColormap(CLASS_COLORS)
+bounds = np.arange(-0.5, 4.5, 1.0)
+norm_classes = BoundaryNorm(bounds, cls_cmap.N)
+
+MONTHS_ABBR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+YEARS_LABELS = [str(y) for y in range(YEAR_START, YEAR_END + 1)]
+DIURNAL_LABELS = ["00","03","06","09","12","15","18","21"]
+CARR_LABELS = [f"P{i}" for i in range(1, 10)]
+
+CYCLES = [
+    dict(
+        name="monthly",
+        file_tag="seasonal",
+        nbins=12,
+        type="climatology",
+        bin_labels=MONTHS_ABBR,
+        rain_units="mm/month",
+        ltg_units="strokes/month",
+        panel_xlabel="Month",
+        title_suffix="Monthly (seasonal) bins, 2005\u20132014"
+    ),
+    dict(
+        name="diurnal",
+        file_tag="diurnal",
+        nbins=8,
+        type="climatology",
+        bin_labels=DIURNAL_LABELS,
+        rain_units="mm/3h",
+        ltg_units="strokes/3h",
+        panel_xlabel="UTC hour",
+        title_suffix="Diurnal 3-hourly bins (UTC), 2005\u20132014"
+    ),
+    dict(
+        name="carrington",
+        file_tag="carrington",
+        nbins=9,
+        type="climatology",
+        bin_labels=CARR_LABELS,
+        rain_units="mm/phase",
+        ltg_units="strokes/phase",
+        panel_xlabel="Carrington phase",
+        title_suffix="Carrington 9-phase bins, 2005\u20132014"
+    ),
+    dict(
+        name="yearly",
+        file_tag="yearly",
+        nbins=N_YEARS_TOTAL,
+        type="years",
+        bin_labels=YEARS_LABELS,
+        rain_units="mm/year",
+        ltg_units="strokes/year",
+        panel_xlabel="Year",
+        title_suffix="Yearly (Schwabe) bins, 2005\u20132014"
+    )
+]
+
+# run which cycles
+CYCLES_TO_RUN = ["monthly","diurnal","carrington","yearly"]
+
+# ----------------- GRID FROM RAIN -----------------
+GRID = dict(init=False, lat=None, lon=None, lat_edges=None, lon_edges=None,
+            Y=None, X=None, extent=None)
+
+
+def _detect_lat_lon_names(ds):
+    latn = next((n for n in ("lat","latitude","y","LAT","LATITUDE")
+                 if n in ds.coords or n in ds.variables), None)
+    lonn = next((n for n in ("lon","longitude","x","LON","LONGITUDE")
+                 if n in ds.coords or n in ds.variables), None)
+    if not latn or not lonn:
+        raise ValueError("Could not find lat/lon coords in rain file.")
+    return latn, lonn
+
+
+def grid_from_first_rain():
+    files = sorted(
+        [os.path.join(RAIN_DIR, f) for f in os.listdir(RAIN_DIR)
+         if f.endswith(".nc4")]
+    )
+    if not files:
+        raise FileNotFoundError("No .nc4 files in RR NEW.")
+    with xr.open_dataset(files[0]) as ds:
+        precip_vars = [v for v in ds.data_vars if "precip" in v.lower()]
+        var = precip_vars[0] if precip_vars else next(
+            (v for v in ds.data_vars if ds[v].ndim >= 2),
+            list(ds.data_vars)[0]
+        )
+        latn, lonn = _detect_lat_lon_names(ds)
+        da = ds[var].squeeze().transpose(latn, lonn)
+        if np.any(np.diff(da[latn].values) < 0):
+            da = da.sortby(latn)
+        if np.any(np.diff(da[lonn].values) < 0):
+            da = da.sortby(lonn)
+        lat = da[latn].values.astype(float)
+        lon = da[lonn].values.astype(float)
+    Y, X = len(lat), len(lon)
+    lat_mid = (lat[:-1] + lat[1:]) / 2.0
+    lon_mid = (lon[:-1] + lon[1:]) / 2.0
+    lat_edges = np.concatenate((
+        [lat[0] - (lat_mid[0] - lat[0])],
+        lat_mid,
+        [lat[-1] + (lat[-1] - lat_mid[-1])]
+    ))
+    lon_edges = np.concatenate((
+        [lon[0] - (lon_mid[0] - lon[0])],
+        lon_mid,
+        [lon[-1] + (lon[-1] - lon_mid[-1])]
+    ))
+    GRID.update(
+        dict(
+            init=True,
+            lat=lat,
+            lon=lon,
+            lat_edges=lat_edges,
+            lon_edges=lon_edges,
+            Y=Y,
+            X=X,
+            extent=(lon.min(), lon.max(), lat.min(), lat.max())
+        )
+    )
+
+
+grid_from_first_rain()
+Y, X = GRID["Y"], GRID["X"]
+lat_edges, lon_edges = GRID["lat_edges"], GRID["lon_edges"]
+
+
+def year_in_range(y):
+    return (y is not None) and (YEAR_START <= y <= YEAR_END)
+
+
+# ----------------- TIME HELPERS -----------------
+def get_datetime_from_rain_file(ds, fpath):
+    if "time" in ds.coords and ds["time"].size >= 1:
+        t = pd.to_datetime(ds["time"].values[0])
+        return t
+    bn = os.path.basename(fpath)
+    m = re.search(r"(\d{8})(\d{2})", bn)
+    if m:
+        ymd = m.group(1)
+        hh = m.group(2)
+        return pd.to_datetime(ymd + hh, format="%Y%m%d%H")
+    m2 = re.search(r"(\d{8})", bn)
+    if m2:
+        return pd.to_datetime(m2.group(1), format="%Y%m%d")
+    return None
+
+
+TIME_RE = re.compile(r"^(\d{2}):?(\d{2})(?::?(\d{2})(?:\.\d+)?)?$")
+
+
+def parse_hh_mm(val, fallback_h):
+    s = str(val).strip()
+    if s.isdigit():
+        if len(s) in (3, 4):
+            s = s.zfill(4)
+            return int(s[:2]), int(s[2:])
+        if len(s) >= 6:
+            s = s.zfill(6)
+    m = TIME_RE.match(s)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return (fallback_h if fallback_h is not None else 0), 30
+
+
+def parse_date_to_yyyymmdd(val, fallback_ymd=None):
+    s = str(val).strip()
+    if re.fullmatch(r"\d{8}", s):
+        return s
+    s2 = s.replace("-", "/").replace(".", "/").replace(" ", "/")
+    dt = pd.to_datetime(s2, errors="coerce", dayfirst=False)
+    if pd.notnull(dt):
+        return dt.strftime("%Y%m%d")
+    if fallback_ymd and re.fullmatch(r"\d{8}", fallback_ymd):
+        return fallback_ymd
+    return None
+
+
+def pick(cols_map, options):
+    for k in options:
+        v = cols_map.get(k)
+        if v is not None:
+            return v
+    return None
+
+
+def bin_index_for_cycle(cycle_name, dt_local):
+    if cycle_name == "monthly":
+        return dt_local.month - 1
+    if cycle_name == "diurnal":
+        return dt_local.hour // 3
+    if cycle_name == "carrington":
+        epoch = pd.Timestamp("2005-01-01 00:00:00")
+        days = (dt_local - epoch).total_seconds() / 86400.0
+        if days < 0:
+            return None
+        phase = days % 27.0
+        idx = int(phase // 3.0)
+        if idx < 0 or idx >= 9:
+            return None
+        return idx
+    if cycle_name == "yearly":
+        y = dt_local.year
+        if not year_in_range(y):
+            return None
+        return y - YEAR_START
+    return None
+
+
+# ----------------- SMOOTH / FEATURES -----------------
+def smooth_circular_1d(curve, k=3):
+    if k <= 1:
+        return curve
+    F = curve.shape[0]
+    pad = (k - 1) // 2
+    ext = np.concatenate([curve[-pad:], curve, curve[:pad]])
+    return np.convolve(ext, np.ones(k) / k, mode="valid")[:F]
+
+
+def smooth_all(arr3d, k=3):
+    F, Y_, X_ = arr3d.shape
+    out = np.empty_like(arr3d)
+    for i in range(Y_):
+        for j in range(X_):
+            out[:, i, j] = smooth_circular_1d(arr3d[:, i, j], k=k)
+    return out
+
+
+def per_pixel_ranks(arr3d):
+    F, Y_, X_ = arr3d.shape
+    out = np.zeros_like(arr3d, dtype=float)
+    for i in range(Y_):
+        for j in range(X_):
+            c = arr3d[:, i, j]
+            order = np.argsort(c, kind="mergesort")
+            ranks = np.empty_like(order, dtype=float)
+            ranks[order] = np.linspace(0, 1, num=F)
+            out[:, i, j] = ranks
+    return out
+
+
+def fit_harmonics_periodic(signal, P):
+    y = np.asarray(signal).astype(float)
+    t = np.arange(len(y))
+    w1 = 2 * np.pi / P
+    w2 = 2 * np.pi / (P / 2.0)
+    Xd = np.column_stack([
+        np.cos(w1 * t),
+        np.sin(w1 * t),
+        np.cos(w2 * t),
+        np.sin(w2 * t),
+        np.ones_like(t)
+    ])
+    beta, *_ = np.linalg.lstsq(Xd, y, rcond=None)
+    a1, b1, a2, b2, _ = beta
+    amp1 = float(np.sqrt(a1 * a1 + b1 * b1))
+    phase1_rad = float(np.arctan2(b1, a1))
+    phase1_units = (phase1_rad / (2 * np.pi)) * P % P
+    coh1 = amp1 / (np.std(y) + 1e-9)
+    return dict(amp1=amp1, phase1_units=phase1_units, coh1=float(coh1))
+
+
+def add_phase_features(vec_list, phase_units, P):
+    phi = phase_units * (2 * np.pi / P)
+    vec_list.extend([np.cos(phi), np.sin(phi)])
+
+
+def majority_filter_labels(arr, passes=1):
+    if passes <= 0:
+        return arr
+    out = arr.copy()
+    for _ in range(passes):
+        arr = out.copy()
+        for i in range(Y):
+            for j in range(X):
+                if np.isnan(arr[i, j]):
+                    continue
+                i0, i1 = max(0, i - 1), min(Y, i + 2)
+                j0, j1 = max(0, j - 1), min(X, j + 2)
+                w = arr[i0:i1, j0:j1].ravel()
+                w = w[~np.isnan(w)]
+                if w.size == 0:
+                    continue
+                vals, cnt = np.unique(w.astype(int), return_counts=True)
+                out[i, j] = vals[np.argmax(cnt)]
+    return out
+
+
+# ----------------- DISPLAY MAP -----------------
+def show_class_map(class_map, title):
+    lon_min, lon_max, lat_min, lat_max = GRID["extent"]
+    arr_plot = np.ma.masked_invalid(class_map)
+    cmap = cls_cmap.copy()
+    cmap.set_bad("#bdbdbd")
+    if _USE_CARTOPY:
+        fig = plt.figure(figsize=(8, 7))
+        ax = plt.axes(projection=ccrs.PlateCarree())
+        ax.set_extent([lon_min, lon_max, lat_min, lat_max])
+        ax.add_feature(cfeature.COASTLINE, linewidth=1.0)
+        ax.add_feature(cfeature.BORDERS, linewidth=0.6)
+        gl = ax.gridlines(draw_labels=True, linewidth=0.4,
+                          color="gray", alpha=0.4, linestyle="--")
+        gl.top_labels = False
+        gl.right_labels = False
+        im = ax.imshow(
+            arr_plot,
+            origin="lower",
+            extent=[lon_min, lon_max, lat_min, lat_max],
+            transform=ccrs.PlateCarree(),
+            cmap=cmap,
+            norm=norm_classes,
+            interpolation="nearest"
+        )
+        cbar = plt.colorbar(im, ax=ax, shrink=0.8,
+                            boundaries=bounds, ticks=[0, 1, 2, 3])
+        cbar.ax.set_yticklabels(["1", "2", "3", "4"])
+        plt.title(title)
+        plt.tight_layout()
+        plt.show()
+    else:
+        plt.figure(figsize=(7, 6))
+        im = plt.imshow(
+            arr_plot,
+            origin="lower",
+            extent=[lon_min, lon_max, lat_min, lat_max],
+            cmap=cmap,
+            norm=norm_classes,
+            interpolation="nearest",
+            aspect="auto"
+        )
+        cbar = plt.colorbar(im, boundaries=bounds, ticks=[0, 1, 2, 3])
+        cbar.ax.set_yticklabels(["1", "2", "3", "4"])
+        plt.xlabel("Longitude")
+        plt.ylabel("Latitude")
+        plt.title(title)
+        plt.tight_layout()
+        plt.show()
+
+
+# ----------------- SOM + QE -----------------
+def _som_qe(som, data):
+    W = som.get_weights()
+    total = 0.0
+    for x in data:
+        i, j = som.winner(x)
+        total += np.linalg.norm(x - W[i, j])
+    return float(total) / len(data)
+
+
+def _qe_curve(data, rows, cols, sigma, lr, checkpoints, seed):
+    qes = []
+    for iters in checkpoints:
+        som = MiniSom(
+            rows, cols, data.shape[1],
+            sigma=sigma, learning_rate=lr,
+            random_seed=seed
+        )
+        if iters >= 2:
+            som.train_random(data, iters)
+        else:
+            som.train_random(data, 2)
+        qes.append(_som_qe(som, data))
+    return np.array(qes, float)
+
+
+def _elbow_index(qe, iters):
+    x = np.array(iters, dtype=float)
+    y = np.array(qe, dtype=float)
+    p1 = np.array([x[0], y[0]])
+    p2 = np.array([x[-1], y[-1]])
+    v = p2 - p1
+    denom = np.linalg.norm(v) + 1e-12
+    d = np.abs(np.cross(v, np.vstack((x - p1[0], y - p1[1])).T)) / denom
+    return int(np.argmax(d))
+
+
+def _detect_stable(qe, iters, rel_tol=0.005, run_len=2):
+    qe = np.asarray(qe, float)
+    iters = np.asarray(iters, int)
+    if qe.size <= 1:
+        return 0, int(iters[-1]), float(qe[-1])
+    rel_drop = np.zeros_like(qe)
+    rel_drop[1:] = (qe[:-1] - qe[1:]) / np.maximum(qe[:-1], 1e-12)
+    for i in range(1, len(qe)):
+        window = rel_drop[i:]
+        if np.all(window < rel_tol) and (len(window) >= run_len):
+            return i, int(iters[i]), float(qe[i])
+    ei = _elbow_index(qe, iters)
+    return ei, int(iters[ei]), float(qe[ei])
+
+
+def _train_som_and_cluster(data_std, rows, cols, sigma, lr,
+                           total_iters, seed, k_final):
+    som = MiniSom(
+        rows, cols, data_std.shape[1],
+        sigma=sigma, learning_rate=lr,
+        random_seed=seed
+    )
+    som.train_random(data_std, total_iters)
+    codebook = som.get_weights().reshape(rows * cols, -1)
+    bmu_idx = np.array(
+        [som.winner(x)[0] * cols + som.winner(x)[1] for x in data_std],
+        int
+    )
+    used = np.unique(bmu_idx)
+    code_used = codebook[used]
+    try:
+        center_labels = AgglomerativeClustering(
+            n_clusters=k_final, linkage="ward"
+        ).fit(code_used).labels_
+    except Exception:
+        center_labels = KMeans(
+            n_clusters=k_final,
+            random_state=seed,
+            n_init=20
+        ).fit_predict(code_used)
+    unit_to_label = {u: int(c) for u, c in zip(used, center_labels)}
+    sample_labels = np.array(
+        [unit_to_label.get(idx, 0) for idx in bmu_idx],
+        int
+    )
+    return som, sample_labels
+
+
+# ----------------- RELABEL TO RLC1..4 -----------------
+def relabel_semantics(cmap, rain_cycle, ltg_cycle):
+    uniq = np.unique(cmap[~np.isnan(cmap)]).astype(int)
+    if uniq.size != 4:
+        return cmap
+    r_mean = {}
+    l_mean = {}
+    for k in uniq:
+        m = (cmap == k)
+        r_mean[k] = float(np.nanmean(rain_cycle[:, m]))
+        l_mean[k] = float(np.nanmean(ltg_cycle[:, m]))
+    r_arr = np.array([r_mean[k] for k in uniq])
+    l_arr = np.array([l_mean[k] for k in uniq])
+    r_n = r_arr / (np.nanmax(r_arr) + 1e-9)
+    l_n = l_arr / (np.nanmax(l_arr) + 1e-9)
+    s = r_n + l_n
+    quiet_old = uniq[np.nanargmin(s)]
+    storm_old = uniq[np.nanargmax(s)]
+    rest = [k for k in uniq if k not in (quiet_old, storm_old)]
+
+    def idx(u):
+        return list(uniq).index(u)
+
+    if (r_n[idx(rest[0])] - l_n[idx(rest[0])]) >= \
+       (r_n[idx(rest[1])] - l_n[idx(rest[1])]):
+        rain_old, ltg_old = rest[0], rest[1]
+    else:
+        rain_old, ltg_old = rest[1], rest[0]
+    mapping = {
+        quiet_old: 0,
+        rain_old: 1,
+        ltg_old: 2,
+        storm_old: 3
+    }
+    newmap = np.full_like(cmap, np.nan)
+    for old, new in mapping.items():
+        newmap[cmap == old] = new
+    return newmap
+
+
+# ----------------- STATS / TABLE HELPERS -----------------
+def blacklines(arr_cycle, class_map, nbins):
+    bl = []
+    for k in range(4):
+        mask = (class_map == k)
+        if np.nansum(mask) == 0:
+            bl.append(np.full((nbins,), np.nan))
+            continue
+        m = arr_cycle[:, mask]
+        bl.append(np.nanmean(m, axis=1))
+    return bl
+
+
+def peak_trough(series, bin_labels):
+    s = np.asarray(series, float)
+    iP = int(np.nanargmax(s))
+    iT = int(np.nanargmin(s))
+    return bin_labels[iP], float(s[iP]), bin_labels[iT], float(s[iT])
+
+
+def summary_table(blacklines_list, var_label, units, bin_labels):
+    rows = []
+    for k, s in enumerate(blacklines_list, start=1):
+        s = np.asarray(s, float)
+        pM, pV, tM, tV = peak_trough(s, bin_labels)
+        rows.append(dict(
+            Variable=f"{var_label} ({units})",
+            Cluster=f"RLC{k}",
+            Mean=float(np.nanmean(s)),
+            STD=float(np.nanstd(s, ddof=0)),
+            Min=float(np.nanmin(s)),
+            Max=float(np.nanmax(s)),
+            PeakBin=pM,
+            PeakValue=pV,
+            TroughBin=tM,
+            TroughValue=tV
+        ))
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "Variable","Cluster","Mean","STD","Min","Max",
+            "PeakBin","PeakValue","TroughBin","TroughValue"
+        ]
+    )
+
+
+def ks_pairwise(series_list):
+    K = len(series_list)
+    ks = np.full((K, K), np.nan, float)
+    pv = np.full((K, K), np.nan, float)
+
+    def ks_fallback(x, y):
+        x = np.sort(np.asarray(x, float))
+        y = np.sort(np.asarray(y, float))
+        x = x[np.isfinite(x)]
+        y = y[np.isfinite(y)]
+        nx, ny = x.size, y.size
+        if nx < 2 or ny < 2:
+            return np.nan, np.nan
+        data_all = np.concatenate([x, y])
+        cdf1 = np.searchsorted(x, data_all, side="right") / nx
+        cdf2 = np.searchsorted(y, data_all, side="right") / ny
+        d = float(np.max(np.abs(cdf1 - cdf2)))
+        en = np.sqrt(nx * ny / (nx + ny))
+        p = float(2.0 * np.exp(-2.0 * (en * d) ** 2))
+        return d, max(0.0, min(1.0, p))
+
+    for i in range(K):
+        xi = np.asarray(series_list[i], float)
+        xi = xi[np.isfinite(xi)]
+        for j in range(i + 1, K):
+            xj = np.asarray(series_list[j], float)
+            xj = xj[np.isfinite(xj)]
+            if _HAVE_SCIPY:
+                res = ks_2samp(xi, xj, alternative="two-sided", mode="auto")
+                d, p = float(res.statistic), float(res.pvalue)
+            else:
+                d, p = ks_fallback(xi, xj)
+            ks[i, j] = d
+            pv[j, i] = p
+    return ks, pv
+
+
+def triangle_df(mat, upper=True):
+    labels = [f"RLC{k}" for k in range(1, 5)]
+    df = pd.DataFrame(mat, index=labels, columns=labels)
+    if upper:
+        mask = np.triu(np.ones_like(mat, bool), 1)
+    else:
+        mask = np.tril(np.ones_like(mat, bool), -1)
+    arr = df.values.copy()
+    arr[~mask] = np.nan
+    return pd.DataFrame(arr, index=df.index, columns=df.columns)
+
+
+def bh_fdr_from_lower(pmat):
+    pairs = []
+    pvals = []
+    for i in range(1, 4):
+        for j in range(i):
+            if np.isfinite(pmat[i, j]):
+                pairs.append((i, j))
+                pvals.append(pmat[i, j])
+    pvals = np.array(pvals, float)
+    m = len(pvals)
+    if m == 0:
+        return np.full((4, 4), np.nan, float)
+    order = np.argsort(pvals)
+    ranked = np.empty_like(pvals)
+    ranked[order] = pvals[order] * m / (np.arange(m) + 1)
+    for k in range(m - 2, -1, -1):
+        ranked[order[k]] = min(ranked[order[k]], ranked[order[k + 1]])
+    ranked = np.minimum(ranked, 1.0)
+    qmat = np.full((4, 4), np.nan, float)
+    for idx, (i, j) in enumerate(pairs):
+        qmat[i, j] = ranked[idx]
+    return qmat
+
+
+# ----------------- AGGREGATION -----------------
+def aggregate_cycle(cycle_cfg):
+    name = cycle_cfg["name"]
+    nbins = cycle_cfg["nbins"]
+    cycle_type = cycle_cfg["type"]
+
+    ltg_total = np.zeros((Y, X), float)
+    years_r_present = set()
+    years_l_present = set()
+
+    if cycle_type == "climatology":
+        rain_by_year = {
+            y: [np.zeros((Y, X), float) for _ in range(nbins)]
+            for y in range(YEAR_START, YEAR_END + 1)
+        }
+        ltg_by_year = {
+            y: [np.zeros((Y, X), float) for _ in range(nbins)]
+            for y in range(YEAR_START, YEAR_END + 1)
+        }
+
+        # Rain
+        nc_files = sorted(
+            os.path.join(RAIN_DIR, f)
+            for f in os.listdir(RAIN_DIR)
+            if f.endswith(".nc4")
+        )
+        for f in nc_files:
+            with xr.open_dataset(f) as ds:
+                latn, lonn = _detect_lat_lon_names(ds)
+                precip_vars = [v for v in ds.data_vars if "precip" in v.lower()]
+                v = precip_vars[0] if precip_vars else next(
+                    (vv for vv in ds.data_vars if ds[vv].ndim >= 2),
+                    list(ds.data_vars)[0]
+                )
+                da = ds[v].squeeze().transpose(latn, lonn)
+                if np.any(np.diff(da[latn].values) < 0):
+                    da = da.sortby(latn)
+                if np.any(np.diff(da[lonn].values) < 0):
+                    da = da.sortby(lonn)
+                rain = np.nan_to_num(da.values)
+                dt_utc = get_datetime_from_rain_file(ds, f)
+            if dt_utc is None:
+                continue
+            year = int(dt_utc.year)
+            if not year_in_range(year):
+                continue
+            dt_local = dt_utc + pd.Timedelta(hours=TZ_SHIFT_HOURS)
+            b = bin_index_for_cycle(name, dt_local)
+            if b is None or b < 0 or b >= nbins:
+                continue
+            rain_by_year[year][b] += rain * 3.0
+            years_r_present.add(year)
+
+        # Lightning
+        ltg_files = sorted(
+            glob.glob(os.path.join(LIGHTNING_DIR, "**", "*.csv"), recursive=True) +
+            glob.glob(os.path.join(LIGHTNING_DIR, "**", "*.CSV"), recursive=True)
+        )
+        for f in ltg_files:
+            try:
+                df = pd.read_csv(f)
+            except Exception:
+                continue
+            if df.shape[0] == 0:
+                continue
+            cols_map = {c.lower().strip(): c for c in df.columns}
+            latc = pick(cols_map, ["lat","latitude","y","latitud","lat_deg"])
+            lonc = pick(cols_map, ["lon","long","longitude","x","longitud","lon_deg"])
+            timec = pick(cols_map, ["time","utctime","hr","hour","hhmm","hrmn"])
+            datec = pick(cols_map, ["date","ymd","yyyymmdd","day","fecha","fecha_yyyymmdd"])
+            if not (latc and lonc):
+                continue
+            keep_cols = [latc, lonc]
+            if timec:
+                keep_cols.append(timec)
+            if datec:
+                keep_cols.append(datec)
+            sub = df[keep_cols].dropna(how="any", subset=[latc, lonc])
+            if len(sub) == 0:
+                continue
+
+            m_dh = re.search(r"A(\d{8})(\d{2})", os.path.basename(f))
+            m8 = re.search(r"(\d{8})", os.path.basename(f))
+            fallback_h = int(m_dh.group(2)) if m_dh else None
+            fallback_ymd = m_dh.group(1) if m_dh else (m8.group(1) if m8 else None)
+
+            sub = sub[
+                (sub[latc] >= lat_edges[0]) & (sub[latc] <= lat_edges[-1]) &
+                (sub[lonc] >= lon_edges[0]) & (sub[lonc] <= lon_edges[-1])
+            ]
+            if len(sub) == 0:
+                continue
+
+            for _, row in sub.iterrows():
+                ymd = parse_date_to_yyyymmdd(row[datec], fallback_ymd) if datec else fallback_ymd
+                if not ymd:
+                    continue
+                if timec:
+                    hh, mm = parse_hh_mm(row[timec], fallback_h)
+                else:
+                    hh, mm = (fallback_h if fallback_h is not None else 0), 30
+                dt = pd.to_datetime(f"{ymd} {hh:02d}:{mm:02d}", format="%Y%m%d %H:%M")
+                dt_local = dt + pd.Timedelta(hours=TZ_SHIFT_HOURS)
+                year = int(dt_local.year)
+                if not year_in_range(year):
+                    continue
+                b = bin_index_for_cycle(name, dt_local)
+                if b is None or b < 0 or b >= nbins:
+                    continue
+                i = np.searchsorted(lat_edges, row[latc]) - 1
+                j = np.searchsorted(lon_edges, row[lonc]) - 1
+                if 0 <= i < Y and 0 <= j < X:
+                    ltg_by_year[year][b][i, j] += 1.0
+                    ltg_total[i, j] += 1.0
+                    years_l_present.add(year)
+
+        def mean_across_years(dct):
+            out = []
+            for b in range(nbins):
+                stacks = [dct[y][b] for y in dct if np.any(dct[y][b])]
+                if len(stacks) == 0:
+                    out.append(np.zeros((Y, X), float))
+                else:
+                    out.append(np.nanmean(np.stack(stacks, axis=0), axis=0))
+            return np.stack(out, axis=0)
+
+        rain_cycle = mean_across_years(rain_by_year)
+        ltg_cycle = mean_across_years(ltg_by_year)
+
+    else:
+        # yearly bins
+        n_years = N_YEARS_TOTAL
+        rain_cycle = np.zeros((n_years, Y, X), float)
+        ltg_cycle = np.zeros((n_years, Y, X), float)
+
+        # Rain
+        nc_files = sorted(
+            os.path.join(RAIN_DIR, f)
+            for f in os.listdir(RAIN_DIR)
+            if f.endswith(".nc4")
+        )
+        for f in nc_files:
+            with xr.open_dataset(f) as ds:
+                latn, lonn = _detect_lat_lon_names(ds)
+                precip_vars = [v for v in ds.data_vars if "precip" in v.lower()]
+                v = precip_vars[0] if precip_vars else next(
+                    (vv for vv in ds.data_vars if ds[vv].ndim >= 2),
+                    list(ds.data_vars)[0]
+                )
+                da = ds[v].squeeze().transpose(latn, lonn)
+                if np.any(np.diff(da[latn].values) < 0):
+                    da = da.sortby(latn)
+                if np.any(np.diff(da[lonn].values) < 0):
+                    da = da.sortby(lonn)
+                rain = np.nan_to_num(da.values)
+                dt_utc = get_datetime_from_rain_file(ds, f)
+            if dt_utc is None:
+                continue
+            year = int(dt_utc.year)
+            if not year_in_range(year):
+                continue
+            dt_local = dt_utc + pd.Timedelta(hours=TZ_SHIFT_HOURS)
+            idx = bin_index_for_cycle(name, dt_local)
+            if idx is None or idx < 0 or idx >= n_years:
+                continue
+            rain_cycle[idx] += rain * 3.0
+            years_r_present.add(year)
+
+        # Lightning
+        ltg_files = sorted(
+            glob.glob(os.path.join(LIGHTNING_DIR, "**", "*.csv"), recursive=True) +
+            glob.glob(os.path.join(LIGHTNING_DIR, "**", "*.CSV"), recursive=True)
+        )
+        for f in ltg_files:
+            try:
+                df = pd.read_csv(f)
+            except Exception:
+                continue
+            if df.shape[0] == 0:
+                continue
+            cols_map = {c.lower().strip(): c for c in df.columns}
+            latc = pick(cols_map, ["lat","latitude","y","latitud","lat_deg"])
+            lonc = pick(cols_map, ["lon","long","longitude","x","longitud","lon_deg"])
+            timec = pick(cols_map, ["time","utctime","hr","hour","hhmm","hrmn"])
+            datec = pick(cols_map, ["date","ymd","yyyymmdd","day","fecha","fecha_yyyymmdd"])
+            if not (latc and lonc):
+                continue
+            keep_cols = [latc, lonc]
+            if timec:
+                keep_cols.append(timec)
+            if datec:
+                keep_cols.append(datec)
+            sub = df[keep_cols].dropna(how="any", subset=[latc, lonc])
+            if len(sub) == 0:
+                continue
+
+            m_dh = re.search(r"A(\d{8})(\d{2})", os.path.basename(f))
+            m8 = re.search(r"(\d{8})", os.path.basename(f))
+            fallback_h = int(m_dh.group(2)) if m_dh else None
+            fallback_ymd = m_dh.group(1) if m_dh else (m8.group(1) if m8 else None)
+
+            sub = sub[
+                (sub[latc] >= lat_edges[0]) & (sub[latc] <= lat_edges[-1]) &
+                (sub[lonc] >= lon_edges[0]) & (sub[lonc] <= lon_edges[-1])
+            ]
+            if len(sub) == 0:
+                continue
+
+            for _, row in sub.iterrows():
+                ymd = parse_date_to_yyyymmdd(row[datec], fallback_ymd) if datec else fallback_ymd
+                if not ymd:
+                    continue
+                if timec:
+                    hh, mm = parse_hh_mm(row[timec], fallback_h)
+                else:
+                    hh, mm = (fallback_h if fallback_h is not None else 0), 30
+                dt = pd.to_datetime(f"{ymd} {hh:02d}:{mm:02d}", format="%Y%m%d %H:%M")
+                dt_local = dt + pd.Timedelta(hours=TZ_SHIFT_HOURS)
+                year = int(dt_local.year)
+                if not year_in_range(year):
+                    continue
+                idx = bin_index_for_cycle(name, dt_local)
+                if idx is None or idx < 0 or idx >= n_years:
+                    continue
+                i = np.searchsorted(lat_edges, row[latc]) - 1
+                j = np.searchsorted(lon_edges, row[lonc]) - 1
+                if 0 <= i < Y and 0 <= j < X:
+                    ltg_cycle[idx, i, j] += 1.0
+                    ltg_total[i, j] += 1.0
+                    years_l_present.add(year)
+
+    return rain_cycle, ltg_cycle, ltg_total, years_r_present, years_l_present
+
+
+# ----------------- MAIN PIPELINE PER CYCLE -----------------
+def run_cycle(cycle_cfg):
+    name = cycle_cfg["name"]
+    if name not in CYCLES_TO_RUN:
+        return
+    nbins = cycle_cfg["nbins"]
+    bin_labels = cycle_cfg["bin_labels"]
+    file_tag = cycle_cfg["file_tag"]
+    rain_units = cycle_cfg["rain_units"]
+    ltg_units = cycle_cfg["ltg_units"]
+    title_suffix = cycle_cfg["title_suffix"]
+
+    os.makedirs(OUT_ROOT, exist_ok=True)
+    out_dir = os.path.join(OUT_ROOT, file_tag)
+    os.makedirs(out_dir, exist_ok=True)
+
+    print(f"=== Cycle: {name} ({file_tag}), nbins={nbins} ===")
+
+    rain_cycle, ltg_cycle, ltg_total, years_r_present, years_l_present = aggregate_cycle(cycle_cfg)
+    print("Years covered rain:", sorted(list(years_r_present)))
+    print("Years covered ltg:", sorted(list(years_l_present)))
+
+    # Smooth along bins
+    rain_smooth = smooth_all(rain_cycle, k=3)
+    ltg_smooth = smooth_all(ltg_cycle, k=3)
+
+    # Mask
+    mask_r = np.nansum(rain_smooth, axis=0) > 0
+    mask_l = ltg_total > 0
+    cluster_mask = mask_r | mask_l
+    if not np.any(cluster_mask):
+        print("No valid pixels for clustering in cycle", name)
+        return
+
+    # Features
+    rain_pct = per_pixel_ranks(rain_smooth)
+    ltg_pct = per_pixel_ranks(ltg_smooth)
+
+    feat_list = []
+    valid_pix = []
+    for i in range(Y):
+        for j in range(X):
+            if not cluster_mask[i, j]:
+                continue
+            r_curve = rain_smooth[:, i, j]
+            l_curve = ltg_smooth[:, i, j]
+            if np.all(np.isnan(r_curve)) and np.all(np.isnan(l_curve)):
+                continue
+            fr = fit_harmonics_periodic(r_curve, P=nbins)
+            fl = fit_harmonics_periodic(l_curve, P=nbins)
+            vec = []
+            vec.extend(rain_pct[:, i, j].tolist())
+            vec.extend(ltg_pct[:, i, j].tolist())
+            add_phase_features(vec, fr["phase1_units"], P=nbins)
+            add_phase_features(vec, fl["phase1_units"], P=nbins)
+            vec.extend([fr["amp1"], fl["amp1"], fr["coh1"], fl["coh1"]])
+            vec.extend([float(np.nanmean(r_curve)), float(np.nanmean(l_curve))])
+            feat_list.append(vec)
+            valid_pix.append(i * X + j)
+
+    if len(feat_list) == 0:
+        print("No feature vectors assembled for cycle", name)
+        return
+
+    features = np.array(feat_list, dtype=float)
+    scaler = StandardScaler()
+    features_std = scaler.fit_transform(features)
+
+    if USE_SOM:
+        n = features_std.shape[0]
+        total_iters = max(SOM_TOTAL_ITERS, 20 * n)
+        som, labels = _train_som_and_cluster(
+            features_std,
+            SOM_ROWS,
+            SOM_COLS,
+            SOM_SIGMA,
+            SOM_LR,
+            total_iters,
+            RANDOM_SEED,
+            K_FOR_FINAL
+        )
+        checkpoints = [c for c in SOM_CHECKPOINTS if c <= total_iters]
+        if checkpoints[-1] != total_iters:
+            checkpoints = checkpoints + [total_iters]
+        qe_points = _qe_curve(
+            features_std,
+            SOM_ROWS,
+            SOM_COLS,
+            SOM_SIGMA,
+            SOM_LR,
+            checkpoints,
+            RANDOM_SEED
+        )
+        stab_idx, stab_iter, qe_star = _detect_stable(qe_points, checkpoints)
+        qe_csv = os.path.join(out_dir, f"S2_QE_{file_tag}_combined.csv")
+        df_qe = pd.DataFrame({
+            "iterations": checkpoints,
+            "QE": qe_points,
+            "stable_flag": [1 if i == stab_idx else 0 for i in range(len(checkpoints))]
+        })
+        df_qe.to_csv(qe_csv, index=False)
+        plt.figure(figsize=(6.2, 4.2))
+        plt.plot(checkpoints, qe_points, linewidth=2)
+        plt.axvline(stab_iter, linestyle="--", alpha=0.6)
+        plt.xlabel("Iterations")
+        plt.ylabel("Quantization Error")
+        plt.title(f"SOM QE vs iterations ({file_tag}, combined)")
+        plt.grid(True, alpha=0.3)
+        qe_png = os.path.join(out_dir, f"S2_QE_curve_{file_tag}.png")
+        plt.tight_layout()
+        plt.savefig(qe_png, dpi=200)
+        plt.show()
+        print(f"SOM stable at {stab_iter} iterations for {file_tag}. QE \u2248 {qe_star:.4f}")
+        print("Saved QE files:", qe_csv, "and", qe_png)
+    else:
+        try:
+            labels = AgglomerativeClustering(
+                n_clusters=K_FOR_FINAL,
+                linkage="ward"
+            ).fit_predict(features_std)
+            uniq, _ = np.unique(labels, return_counts=True)
+            if uniq.size < K_FOR_FINAL:
+                raise RuntimeError("Ward returned fewer than 4 clusters.")
+        except Exception:
+            labels = KMeans(
+                n_clusters=K_FOR_FINAL,
+                random_state=RANDOM_SEED,
+                n_init=20
+            ).fit_predict(features_std)
+
+    # Map labels back to grid
+    label_map = np.full(Y * X, np.nan)
+    for p, lab in enumerate(labels):
+        label_map[valid_pix[p]] = int(lab)
+    label_map = label_map.reshape(Y, X)
+    label_map = majority_filter_labels(label_map, passes=SMOOTH_LABEL_PASSES)
+
+    # Relabel to RLC1..4
+    class_map = relabel_semantics(label_map, rain_smooth, ltg_smooth)
+
+    print("Pixel counts by class RLC1..4:",
+          [int(np.nansum(class_map == k)) for k in range(4)])
+
+    # Map
+    show_class_map(class_map, f"Thunderstorm Classes (K=4, SOM\u2192Ward) \u2014 {title_suffix}")
+
+    # Spaghetti panels
+    plt.rcParams.update({
+        "figure.dpi": 180,
+        "axes.facecolor": "white",
+        "axes.edgecolor": "#dddddd",
+        "axes.linewidth": 0.8,
+        "axes.grid": True,
+        "grid.color": "#e6e6e6",
+        "grid.linewidth": 0.8,
+        "grid.alpha": 1.0,
+        "xtick.color": "#2b2b2b",
+        "ytick.color": "#2b2b2b",
+        "font.size": 10
+    })
+
+    PANEL_LETTERS = ["a", "b", "c", "d"]
+
+    def style_axes(ax):
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_color("#bdbdbd")
+        ax.spines["bottom"].set_color("#bdbdbd")
+        ax.grid(True, which="major", linestyle="--", linewidth=0.8, alpha=0.35)
+        ax.set_xlim(1, nbins)
+        ax.set_xticks(np.arange(1, nbins + 1))
+        ax.set_xticklabels(bin_labels)
+
+    def panel_spaghetti(ax, curves, color_hex, title_left,
+                        count_text, y_label, y_max=None):
+        x = np.arange(1, nbins + 1)
+        for col in curves.T:
+            ax.plot(
+                x, col,
+                color=color_hex,
+                alpha=0.10,
+                lw=1.0
+            )
+        p25 = np.nanpercentile(curves, 25, axis=1)
+        p75 = np.nanpercentile(curves, 75, axis=1)
+        mean_curve = np.nanmean(curves, axis=1)
+        ax.fill_between(x, p25, p75, color=color_hex, alpha=0.18)
+        ax.plot(x, mean_curve, color="black", lw=3.0)
+        if y_max is None:
+            y_max = float(np.nanpercentile(curves, 95)) * 1.05
+            if not np.isfinite(y_max) or y_max <= 0:
+                y_max = 1.0
+        ax.set_ylim(0, y_max)
+        style_axes(ax)
+        ax.set_ylabel(y_label)
+        ax.text(
+            0.01, 0.93, title_left,
+            transform=ax.transAxes,
+            ha="left", va="top", fontsize=11, color="#1a1a1a"
+        )
+        ax.text(
+            0.99, 0.93, count_text,
+            transform=ax.transAxes,
+            ha="right", va="top", fontsize=11, color="#1a1a1a"
+        )
+
+    # Shared y scales
+    ymax_r_list = []
+    ymax_l_list = []
+    for k in range(4):
+        m = (class_map == k)
+        if np.nansum(m) == 0:
+            ymax_r_list.append(1.0)
+            ymax_l_list.append(1.0)
+            continue
+        ymax_r_list.append(float(np.nanpercentile(rain_smooth[:, m], 95)))
+        ymax_l_list.append(float(np.nanpercentile(ltg_smooth[:, m], 95)))
+    YMAX_R = (np.nanmax(ymax_r_list) if np.isfinite(np.nanmax(ymax_r_list)) else 1.0) * 1.05
+    YMAX_L = (np.nanmax(ymax_l_list) if np.isfinite(np.nanmax(ymax_l_list)) else 1.0) * 1.05
+
+    fig, axes = plt.subplots(nrows=4, ncols=2, figsize=(10.5, 9.5), sharex=False)
+    plt.subplots_adjust(hspace=0.35, wspace=0.22)
+
+    for k in range(4):
+        mask_k = (class_map == k)
+        n = int(np.nansum(mask_k))
+
+        axL = axes[k, 0]
+        if n > 0:
+            curves_r = rain_smooth[:, mask_k]
+            panel_spaghetti(axL, curves_r, CLASS_COLORS[k],
+                            f"({PANEL_LETTERS[k]}) RLC{k+1}",
+                            f"Count: {n}", rain_units, y_max=YMAX_R)
+        else:
+            style_axes(axL)
+            axL.text(0.5, 0.5, "No pixels", ha="center", va="center", transform=axL.transAxes)
+            axL.set_ylabel(rain_units)
+
+        axR = axes[k, 1]
+        if n > 0:
+            curves_l = ltg_smooth[:, mask_k]
+            panel_spaghetti(axR, curves_l, CLASS_COLORS[k],
+                            f"RLC{k+1}",
+                            f"Count: {n}", ltg_units, y_max=YMAX_L)
+        else:
+            style_axes(axR)
+            axR.text(0.5, 0.5, "No pixels", ha="center", va="center", transform=axR.transAxes)
+            axR.set_ylabel(ltg_units)
+
+    axes[0, 0].set_title("Rainfall", fontsize=12, pad=6, color="#1a1a1a")
+    axes[0, 1].set_title("Lightning", fontsize=12, pad=6, color="#1a1a1a")
+
+    plt.tight_layout()
+    fig_path = os.path.join(out_dir, f"S1_spaghetti_{file_tag}.png")
+    plt.savefig(fig_path, dpi=200)
+    plt.show()
+    print("Saved spaghetti figure:", fig_path)
+
+    # Tables
+    rain_bl = blacklines(rain_smooth, class_map, nbins)
+    ltg_bl = blacklines(ltg_smooth, class_map, nbins)
+
+    df_sum_rain = summary_table(rain_bl, "Rainfall", rain_units, bin_labels)
+    df_sum_ltg = summary_table(ltg_bl, "Lightning", ltg_units, bin_labels)
+    df_S3 = pd.concat([df_sum_rain, df_sum_ltg], ignore_index=True)
+
+    ks_ltg, p_ltg = ks_pairwise(ltg_bl)
+    ks_rain, p_rain = ks_pairwise(rain_bl)
+    q_ltg = bh_fdr_from_lower(p_ltg)
+    q_rain = bh_fdr_from_lower(p_rain)
+
+    f_s3 = os.path.join(out_dir, f"S3_{file_tag}_summary_with_peaks.csv")
+    f_ltg_ks = os.path.join(out_dir, f"S4_{file_tag}_lightning_KS_upper.csv")
+    f_ltg_p = os.path.join(out_dir, f"S4_{file_tag}_lightning_pvalues_lower.csv")
+    f_ltg_q = os.path.join(out_dir, f"S4_{file_tag}_lightning_FDRq_lower.csv")
+    f_rain_ks = os.path.join(out_dir, f"S5_{file_tag}_rainfall_KS_upper.csv")
+    f_rain_p = os.path.join(out_dir, f"S5_{file_tag}_rainfall_pvalues_lower.csv")
+    f_rain_q = os.path.join(out_dir, f"S5_{file_tag}_rainfall_FDRq_lower.csv")
+
+    df_S3.to_csv(f_s3, index=False)
+    triangle_df(ks_ltg, upper=True).to_csv(f_ltg_ks)
+    triangle_df(p_ltg, upper=False).to_csv(f_ltg_p)
+    triangle_df(q_ltg, upper=False).to_csv(f_ltg_q)
+    triangle_df(ks_rain, upper=True).to_csv(f_rain_ks)
+    triangle_df(p_rain, upper=False).to_csv(f_rain_p)
+    triangle_df(q_rain, upper=False).to_csv(f_rain_q)
+
+    print("Saved CSVs for", file_tag)
+    print(" ", f_s3)
+    print(" ", f_ltg_ks)
+    print(" ", f_ltg_p)
+    print(" ", f_ltg_q)
+    print(" ", f_rain_ks)
+    print(" ", f_rain_p)
+    print(" ", f_rain_q)
+
+
+def main():
+    for cfg in CYCLES:
+        run_cycle(cfg)
+
+
+if __name__ == "__main__":
+    main()
